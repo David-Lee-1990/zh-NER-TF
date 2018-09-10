@@ -7,6 +7,8 @@ from tensorflow.contrib.crf import viterbi_decode
 from data import pad_sequences, batch_yield
 from utils import get_logger
 from eval import conlleval
+from tensorflow.python.tools import inspect_checkpoint as chkp
+from mul_rnn import stack_bidirectional_dynamic_rnn_revised
 
 
 class BiLSTM_CRF(object):
@@ -34,7 +36,7 @@ class BiLSTM_CRF(object):
     def build_graph(self):
         self.add_placeholders()
         self.lookup_layer_op()
-        self.biLSTM_layer_op()
+        self.biLSTM_layer_op_2_elmos()
         self.softmax_pred_op()
         self.loss_op()
         self.trainstep_op()
@@ -59,7 +61,43 @@ class BiLSTM_CRF(object):
                                                      name="word_embeddings")
         self.word_embeddings =  tf.nn.dropout(word_embeddings, self.dropout_pl)
 
-    def biLSTM_layer_op(self):
+    
+    # 一层双向LSTM，然后直接输出
+    def biLSTM_layer_op_original(self):
+
+            with tf.variable_scope("bi-lstm"):
+                cell_fw = LSTMCell(self.hidden_dim)
+                cell_bw = LSTMCell(self.hidden_dim)
+                (output_fw_seq, output_bw_seq), _ = tf.nn.bidirectional_dynamic_rnn(
+                    cell_fw=cell_fw,
+                    cell_bw=cell_bw,
+                    inputs=self.word_embeddings,
+                    sequence_length=self.sequence_lengths,
+                    dtype=tf.float32)
+
+                output = tf.concat([output_fw_seq, output_bw_seq], axis=-1)
+                output = tf.nn.dropout(output, self.dropout_pl)
+
+            with tf.variable_scope("proj"):
+                W = tf.get_variable(name="W",
+                                    shape=[2 * self.hidden_dim, self.num_tags],
+                                    initializer=tf.contrib.layers.xavier_initializer(),
+                                    dtype=tf.float32)
+
+                b = tf.get_variable(name="b",
+                                    shape=[self.num_tags],
+                                    initializer=tf.zeros_initializer(),
+                                    dtype=tf.float32)
+
+                s = tf.shape(output)
+                output = tf.reshape(output, [-1, 2*self.hidden_dim])
+                pred = tf.matmul(output, W) + b
+
+                self.logits = tf.reshape(pred, [-1, s[1], self.num_tags])
+
+
+    # 在original的基础上，对于双向产生的向量进行了加权
+    def biLSTM_layer_op_original_elmos(self): 
         with tf.variable_scope("bi-lstm"):
             cell_fw = LSTMCell(self.hidden_dim)
             cell_bw = LSTMCell(self.hidden_dim)
@@ -69,8 +107,103 @@ class BiLSTM_CRF(object):
                 inputs=self.word_embeddings,
                 sequence_length=self.sequence_lengths,
                 dtype=tf.float32)
-            output = tf.concat([output_fw_seq, output_bw_seq], axis=-1)
+
+            # 这里修改为ELMOs的想法进行测试 ，下面的shape也要进行相应修改
+            w_1 = tf.get_variable(name = 'w_1',
+                                 shape = [1],
+                                 initializer = tf.random_normal_initializer(),
+                                 dtype = tf.float32)
+            w_2 = tf.get_variable(name = 'w_2',
+                                 shape = [1],
+                                 initializer = tf.random_normal_initializer(),
+                                 dtype = tf.float32)     
+            
+            output = tf.add(tf.multiply(output_fw_seq,w_1),tf.multiply(output_bw_seq,w_2)) 
+            # output = tf.concat([output_fw_seq, output_bw_seq], axis=-1)
             output = tf.nn.dropout(output, self.dropout_pl)
+
+        with tf.variable_scope("proj"):
+            W = tf.get_variable(name="W",
+                                # shape=[2 * self.hidden_dim, self.num_tags],
+                                shape=[self.hidden_dim, self.num_tags],
+                                initializer=tf.contrib.layers.xavier_initializer(),
+                                dtype=tf.float32)
+
+            b = tf.get_variable(name="b",
+                                shape=[self.num_tags],
+                                initializer=tf.zeros_initializer(),
+                                dtype=tf.float32)
+
+            s = tf.shape(output)
+            output = tf.reshape(output, [-1, self.hidden_dim])
+            # output = tf.reshape(output, [-1, 2*self.hidden_dim])
+            pred = tf.matmul(output, W) + b
+
+            self.logits = tf.reshape(pred, [-1, s[1], self.num_tags])
+
+
+    # 双向LSTM，两层，之后直接输出
+    def biLSTM_layer_op_2(self): 
+
+        with tf.variable_scope("bi-lstm"):
+            cells_fw = [LSTMCell(self.hidden_dim),LSTMCell(self.hidden_dim)]
+            cells_bw = [LSTMCell(self.hidden_dim),LSTMCell(self.hidden_dim)]
+            (outputs, _, _) = tf.contrib.rnn.stack_bidirectional_dynamic_rnn(
+                cells_fw=cells_fw,
+                cells_bw=cells_bw,
+                inputs=self.word_embeddings,
+                sequence_length=self.sequence_lengths,
+                dtype=tf.float32)
+        print(outputs.get_shape()[2])
+        output = tf.nn.dropout(outputs, self.dropout_pl)
+
+        with tf.variable_scope("proj"):
+            W = tf.get_variable(name="W",
+                                shape=[2 * self.hidden_dim, self.num_tags],
+                                initializer=tf.contrib.layers.xavier_initializer(),
+                                dtype=tf.float32)
+
+            b = tf.get_variable(name="b",
+                                shape=[self.num_tags],
+                                initializer=tf.zeros_initializer(),
+                                dtype=tf.float32)
+
+            s = tf.shape(output)
+            output = tf.reshape(output, [-1, 2*self.hidden_dim])
+            pred = tf.matmul(output, W) + b
+
+            self.logits = tf.reshape(pred, [-1, s[1], self.num_tags])
+
+
+    # 双向LSTM，两层，elmos
+    def biLSTM_layer_op_2_elmos(self): 
+
+        with tf.variable_scope("bi-lstm"):
+
+            cells_fw = [LSTMCell(self.hidden_dim),LSTMCell(self.hidden_dim)]
+            cells_bw = [LSTMCell(self.hidden_dim),LSTMCell(self.hidden_dim)]
+            F_outputs, B_outputs = stack_bidirectional_dynamic_rnn_revised(
+                cells_fw=cells_fw,
+                cells_bw=cells_bw,
+                inputs=self.word_embeddings,
+                sequence_length=self.sequence_lengths,
+                dtype=tf.float32)
+        
+            outputs = tf.concat([F_outputs,B_outputs],3)
+
+            w_1 = tf.get_variable(name='w_1',
+                                shape=[1],
+                                initializer=tf.random_normal_initializer(),
+                                dtype=tf.float32)
+
+            w_2 = tf.get_variable(name='w_2',
+                                    shape=[1],
+                                    initializer=tf.random_normal_initializer(),
+                                    dtype=tf.float32)
+
+            outputs = tf.add(tf.multiply(outputs[0],w_1),tf.multiply(outputs[1],w_2))
+
+        output = tf.nn.dropout(outputs, self.dropout_pl)
 
         with tf.variable_scope("proj"):
             W = tf.get_variable(name="W",
@@ -143,6 +276,7 @@ class BiLSTM_CRF(object):
         """
         self.merged = tf.summary.merge_all()
         self.file_writer = tf.summary.FileWriter(self.summary_path, sess.graph)
+        self.file_writer.add_graph(sess.graph)
 
     def train(self, train, dev):
         """
@@ -164,6 +298,8 @@ class BiLSTM_CRF(object):
         saver = tf.train.Saver()
         with tf.Session(config=self.config) as sess:
             self.logger.info('=========== testing ===========')
+            print('HERE')
+            # chkp.print_tensors_in_checkpoint_file(self.model_path, tensor_name='', all_tensors=True)
             saver.restore(sess, self.model_path)
             label_list, seq_len_list = self.dev_one_epoch(sess, test)
             self.evaluate(label_list, seq_len_list, test)
